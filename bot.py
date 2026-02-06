@@ -1,147 +1,213 @@
 import discord
 from discord.ext import commands, tasks
 from discord import app_commands
+from discord.ui import View, Select, Button, ChannelSelect
 import aiohttp
 import json
+import asyncio
 import os
-from datetime import datetime, timezone
+import time
 
-# ✅ Token is now read from environment variables
-TOKEN = os.getenv("TOKEN")
-GUILD_ID = 1379141195388813393  # Replace with your server ID
+TOKEN = os.getenv("DISCORD_TOKEN")
+GUILD_ID = int(os.getenv("GUILD_ID"))
+
+MONITOR_FILE = "monitors.json"
 
 intents = discord.Intents.default()
-intents.message_content = True
 bot = commands.Bot(command_prefix="!", intents=intents)
 tree = bot.tree
 
-MONITOR_FILE = "monitors.json"
-SEEN_FILE = "seen.json"
+# ---------- LOAD / SAVE ----------
 
-# -------- HELPER FUNCTIONS --------
-def load_json(file, default):
-    try:
-        with open(file, "r") as f:
-            return json.load(f)
-    except:
-        return default
+def load_json(file):
+    if not os.path.exists(file):
+        return []
+    with open(file, "r") as f:
+        return json.load(f)
 
 def save_json(file, data):
     with open(file, "w") as f:
         json.dump(data, f, indent=4)
 
-monitors = load_json(MONITOR_FILE, [])
-seen = load_json(SEEN_FILE, {})
+monitors = load_json(MONITOR_FILE)
+seen_items = set()
 
-def build_url(keyword, max_price):
-    """Builds a Vinted API URL for the monitor"""
-    return (
-        "https://www.vinted.co.uk/api/v2/catalog/items?"
-        f"search_text={keyword}"
-        f"&price_to={max_price}"
-        "&order=newest_first"
-        "&per_page=20"
-    )
+# ---------- BUILD URL ----------
 
-def estimate_total(price):
-    """Estimate total cost including buyer fee and shipping"""
+def build_url(keyword, price):
+
+    keyword = keyword.replace(" ", "%20")
+
+    return f"https://www.vinted.co.uk/api/v2/catalog/items?search_text={keyword}&price_to={price}&order=newest_first"
+
+# ---------- FETCH ITEMS ----------
+
+async def fetch_items(url):
+
+    headers = {
+        "User-Agent": "Mozilla/5.0"
+    }
+
+    async with aiohttp.ClientSession() as session:
+        async with session.get(url, headers=headers) as resp:
+
+            if resp.status != 200:
+                return []
+
+            data = await resp.json()
+
+            return data.get("items", [])
+
+# ---------- CALCULATE EXTRA COSTS ----------
+
+def calculate_total(price):
+
     buyer_fee = price * 0.05 + 0.7
     shipping = 2.99
+
     total = price + buyer_fee + shipping
-    return buyer_fee, shipping, total
 
-def time_ago(timestamp):
-    """Convert Vinted ISO time to minutes ago"""
-    now = datetime.now(timezone.utc)
-    item_time = datetime.fromisoformat(timestamp.replace("Z","+00:00"))
-    diff = now - item_time
-    minutes = int(diff.total_seconds() / 60)
-    return f"{minutes} min ago"
+    return round(total, 2), round(buyer_fee, 2), shipping
 
-# -------- DISCORD EVENTS --------
-@bot.event
-async def on_ready():
-    print(f"✅ Logged in as {bot.user}")
-    await tree.sync(guild=discord.Object(id=GUILD_ID))
-    print("✅ Commands synced")
-    fast_monitor.start()
+# ---------- SEND ITEM ----------
 
-# -------- SLASH COMMANDS --------
-@tree.command(name="monitor", description="Create a Vinted monitor", guild=discord.Object(id=GUILD_ID))
-@app_commands.describe(keyword="Keyword (example: nike)", max_price="Maximum price", channel="Channel for alerts")
-async def monitor(interaction: discord.Interaction, keyword: str, max_price: int, channel: discord.TextChannel):
-    url = build_url(keyword, max_price)
-    monitors.append({
-        "keyword": keyword,
-        "price": max_price,
-        "channel": channel.id,
-        "url": url
-    })
-    save_json(MONITOR_FILE, monitors)
-    await interaction.response.send_message(
-        f"✅ Monitoring '{keyword}' under £{max_price} in {channel.mention}"
+async def send_item(channel, item):
+
+    item_id = item["id"]
+
+    if item_id in seen_items:
+        return
+
+    seen_items.add(item_id)
+
+    title = item["title"]
+    price = float(item["price"]["amount"])
+    brand = item.get("brand_title", "Unknown")
+    size = item.get("size_title", "Unknown")
+    image = item["photo"]["url"]
+    url = item["url"]
+
+    seller = item["user"]["login"]
+    rating = item["user"].get("feedback_reputation", 0)
+
+    total, fee, shipping = calculate_total(price)
+
+    embed = discord.Embed(
+        title=title,
+        url=url,
+        color=0x00ff99
     )
 
-@tree.command(name="monitors", description="List active monitors", guild=discord.Object(id=GUILD_ID))
-async def monitors_list(interaction: discord.Interaction):
+    embed.set_thumbnail(url=image)
+
+    embed.add_field(name="💰 Price", value=f"£{price}", inline=True)
+    embed.add_field(name="🏷 Brand", value=brand, inline=True)
+    embed.add_field(name="📏 Size", value=size, inline=True)
+
+    embed.add_field(name="👤 Seller", value=seller, inline=True)
+    embed.add_field(name="⭐ Rating", value=f"{rating}", inline=True)
+
+    embed.add_field(name="💸 Buyer Fee", value=f"£{fee}", inline=True)
+    embed.add_field(name="🚚 Shipping", value=f"£{shipping}", inline=True)
+    embed.add_field(name="💵 Total Cost", value=f"£{total}", inline=True)
+
+    await channel.send(embed=embed)
+
+# ---------- MONITOR LOOP ----------
+
+@tasks.loop(seconds=15)
+async def monitor_loop():
+
+    await bot.wait_until_ready()
+
+    for monitor in monitors:
+
+        channel = bot.get_channel(monitor["channel"])
+
+        if not channel:
+            continue
+
+        items = await fetch_items(monitor["url"])
+
+        for item in items[:5]:
+            await send_item(channel, item)
+
+# ---------- DASHBOARD ----------
+
+sessions = {}
+
+@tree.command(name="dashboard", description="Open Vinted dashboard", guild=discord.Object(id=GUILD_ID))
+async def dashboard(interaction: discord.Interaction):
+
+    sessions[interaction.user.id] = {
+        "brand": "",
+        "category": "",
+        "size": "",
+        "price": 100,
+        "channel": interaction.channel.id
+    }
+
+    brand = discord.ui.TextInput(label="Brand", placeholder="Nike, Stussy, Zara, ANY brand")
+
+    category = discord.ui.TextInput(label="Category", placeholder="Shoes, Hoodie, Jacket")
+
+    size = discord.ui.TextInput(label="Size", placeholder="S, M, L, XL")
+
+    price = discord.ui.TextInput(label="Max Price", placeholder="40")
+
+    class Modal(discord.ui.Modal, title="Create Monitor"):
+
+        brand_input = brand
+        category_input = category
+        size_input = size
+        price_input = price
+
+        async def on_submit(self, interaction2):
+
+            keyword = f"{self.brand_input.value} {self.category_input.value} {self.size_input.value}"
+
+            url = build_url(keyword, int(self.price_input.value))
+
+            monitors.append({
+                "keyword": keyword,
+                "price": int(self.price_input.value),
+                "channel": interaction.channel.id,
+                "url": url
+            })
+
+            save_json(MONITOR_FILE, monitors)
+
+            await interaction2.response.send_message(
+                f"✅ Monitor created\n{keyword}\nMax price £{self.price_input.value}"
+            )
+
+    await interaction.response.send_modal(Modal())
+
+# ---------- VIEW MONITORS ----------
+
+@tree.command(name="monitors", description="View monitors", guild=discord.Object(id=GUILD_ID))
+async def view_monitors(interaction: discord.Interaction):
+
     if not monitors:
-        await interaction.response.send_message("No active monitors")
+        await interaction.response.send_message("No monitors active")
         return
-    msg = ""
+
+    text = ""
+
     for m in monitors:
-        ch = bot.get_channel(m["channel"])
-        msg += f"{m['keyword']} → {ch.mention}\n"
-    await interaction.response.send_message(msg)
+        text += f"{m['keyword']} - £{m['price']}\n"
 
-@tree.command(name="test", description="Test the bot", guild=discord.Object(id=GUILD_ID))
-async def test(interaction: discord.Interaction):
-    await interaction.response.send_message("✅ Bot is online and working!")
+    await interaction.response.send_message(text)
 
-# -------- MONITOR LOOP --------
-@tasks.loop(seconds=5)
-async def fast_monitor():
-    async with aiohttp.ClientSession() as session:
-        headers = {"User-Agent":"Mozilla/5.0"}
-        for m in monitors:
-            try:
-                async with session.get(m["url"], headers=headers) as resp:
-                    data = await resp.json()
-                items = data.get("items", [])
-                channel = bot.get_channel(m["channel"])
-                for item in items:
-                    item_id = str(item["id"])
-                    if item_id in seen:
-                        continue
-                    seen[item_id] = True
-                    save_json(SEEN_FILE, seen)
-                    # Extract info
-                    title = item["title"]
-                    price = float(item["price"]["amount"])
-                    brand = item.get("brand_title", "Unknown")
-                    size = item.get("size_title", "Unknown")
-                    image = item["photo"]["url"]
-                    url = item["url"]
-                    user = item["user"]["login"]
-                    rating = item["user"].get("feedback_reputation", 0)
-                    created = item["created_at"]
-                    ago = time_ago(created)
-                    fee, shipping, total = estimate_total(price)
-                    # Build embed
-                    embed = discord.Embed(title=title, url=url, color=0x00ff00)
-                    embed.set_image(url=image)
-                    embed.add_field(name="Price", value=f"£{price}", inline=True)
-                    embed.add_field(name="Brand", value=brand, inline=True)
-                    embed.add_field(name="Size", value=size, inline=True)
-                    embed.add_field(name="Seller", value=f"{user} ⭐{rating}", inline=True)
-                    embed.add_field(name="Posted", value=ago, inline=True)
-                    embed.add_field(
-                        name="Total Cost",
-                        value=f"Item: £{price}\nBuyer fee: £{fee:.2f}\nShipping: £{shipping}\nTotal: £{total:.2f}",
-                        inline=False
-                    )
-                    await channel.send(embed=embed)
-            except Exception as e:
-                print("Monitor error:", e)
+# ---------- READY ----------
 
-# -------- RUN BOT --------
+@bot.event
+async def on_ready():
+
+    await tree.sync(guild=discord.Object(id=GUILD_ID))
+
+    print(f"Logged in as {bot.user}")
+
+    monitor_loop.start()
+
 bot.run(TOKEN)
