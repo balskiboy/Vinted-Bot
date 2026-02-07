@@ -46,21 +46,31 @@ seen = load_json(SEEN_FILE, {})
 
 async def fetch_items(session):
 
-    url = "https://www.vinted.co.uk/api/v2/catalog/items?page=1&per_page=20&order=newest_first"
+    url = "https://www.vinted.co.uk/api/v2/catalog/items"
+
+    params = {
+        "page": 1,
+        "per_page": 20,
+        "order": "newest_first"
+    }
 
     headers = {
-        "User-Agent": "Mozilla/5.0",
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)",
         "Accept": "application/json",
         "Referer": "https://www.vinted.co.uk/",
-        "Origin": "https://www.vinted.co.uk"
+        "Origin": "https://www.vinted.co.uk",
+        "Connection": "keep-alive"
     }
 
     try:
-        async with session.get(url, headers=headers) as resp:
+
+        async with session.get(url, headers=headers, params=params) as resp:
 
             print("Vinted response:", resp.status)
 
             if resp.status != 200:
+                text = await resp.text()
+                print("Error body:", text)
                 return []
 
             data = await resp.json()
@@ -72,8 +82,10 @@ async def fetch_items(session):
             return items
 
     except Exception as e:
+
         print("Fetch error:", e)
         return []
+
 
 # ========================
 # DASHBOARD COMMAND
