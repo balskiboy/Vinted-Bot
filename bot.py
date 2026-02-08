@@ -192,12 +192,16 @@ async def list_trackers(interaction: discord.Interaction):
 # Sync commands and start
 @bot.event
 async def on_ready():
+    print(f"Logged in as {bot.user}")
 
-    guild = discord.Object(id=GUILD_ID)
-
-    await tree.sync(guild=guild)
+    try:
+        synced = await bot.tree.sync(guild=discord.Object(id=GUILD_ID))
+        print(f"Synced {len(synced)} commands to guild")
+    except Exception as e:
+        print(f"Sync error: {e}")
 
     print("Bot ready")
+
     tracker.start()
 
 bot.run(TOKEN)
